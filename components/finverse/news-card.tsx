@@ -1,5 +1,6 @@
 "use client"
 
+import { useRouter } from "next/navigation"
 import { Sparkline } from "@/components/finverse/sparkline"
 import { SentimentBadge } from "@/components/finverse/sentiment-badge"
 import { cn } from "@/lib/utils"
@@ -10,17 +11,13 @@ interface NewsCardProps {
 }
 
 export function NewsCard({ item }: NewsCardProps) {
+  const router = useRouter()
   const isPositive = item.priceChange >= 0
 
-  const CardWrapper = item.url && item.url !== "#" ? "a" : "div"
-  const linkProps = item.url && item.url !== "#"
-    ? { href: item.url, target: "_blank" as const, rel: "noopener noreferrer" }
-    : {}
-
   return (
-    <CardWrapper
-      {...linkProps}
-      className="group relative flex flex-col gap-4 rounded-2xl border border-border bg-card p-5 transition-all duration-300 hover:border-finverse-accent/30 hover:shadow-lg hover:shadow-finverse-navy/5"
+    <div
+      onClick={() => router.push(`/ticker/${item.ticker}`)}
+      className="group relative flex flex-col gap-4 rounded-2xl border border-border bg-card p-5 transition-all duration-300 hover:border-finverse-accent/30 hover:shadow-lg hover:shadow-finverse-navy/5 cursor-pointer"
     >
       {/* Top row: ticker + sparkline */}
       <div className="flex items-start justify-between gap-3">
@@ -67,7 +64,7 @@ export function NewsCard({ item }: NewsCardProps) {
       </div>
 
       {/* Title */}
-      <h3 className="text-sm font-semibold leading-snug text-foreground line-clamp-2 text-pretty">
+      <h3 className="text-sm font-semibold leading-snug text-foreground line-clamp-2 text-pretty group-hover:text-finverse-accent transition-colors">
         {item.title}
       </h3>
 
@@ -80,6 +77,15 @@ export function NewsCard({ item }: NewsCardProps) {
         </div>
         <SentimentBadge sentiment={item.sentiment} score={item.sentimentScore} />
       </div>
-    </CardWrapper>
+
+      {/* Hover hint */}
+      <div className="absolute bottom-3 right-4 flex items-center gap-1 text-[10px] text-finverse-accent opacity-0 group-hover:opacity-100 transition-opacity">
+        <span>Detayları gör</span>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}
+          strokeLinecap="round" strokeLinejoin="round" className="w-3 h-3">
+          <path d="M5 12h14M12 5l7 7-7 7" />
+        </svg>
+      </div>
+    </div>
   )
 }
