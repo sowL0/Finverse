@@ -1,9 +1,5 @@
-import { NewsFeed } from "@/components/finverse/news-feed"
+import { redirect } from 'next/navigation';
 
-export default function Page() {
-  return (
-    <main className="min-h-screen bg-background">
-      <NewsFeed />
-    </main>
-  )
+export default function Home() {
+  redirect('/feed');
 }
