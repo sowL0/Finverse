@@ -129,7 +129,7 @@ export default function ProfilePage({ profile = MOCK_PROFILE }: ProfilePageProps
     n >= 1000 ? (n / 1000).toFixed(1) + 'K' : n.toString();
 
   return (
-    <div className="flex-1 overflow-y-auto pb-24">
+    <div className="flex flex-col min-h-full">
 
       {/* ── Back + title bar ── */}
       <div className="flex items-center justify-between px-5 pt-5 pb-4">
