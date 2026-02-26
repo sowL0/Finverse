@@ -1,24 +1,16 @@
 import { NextResponse } from "next/server"
-import {
-  getMarketNews,
-  getQuote,
-  getNewsSentiment,
-  getStockCandles,
-  isApiConfigured,
-} from "@/lib/finnhub/client"
-import type { NewsItem, SentimentType, CategoryType } from "@/lib/finnhub/types"
+import type { NewsItem, SentimentType, CategoryType, TickerItem } from "@/lib/finnhub/types"
 import { mockNewsData, mockTickerData } from "@/lib/finnhub/mock-data"
+import { isApiConfigured, getMarketNews, getQuote, getNewsSentiment, getStockCandles } from "@/lib/finnhub/client"
 
-// Popular symbols we track for enrichment
-const TRACKED_SYMBOLS = ["AAPL", "TSLA", "NVDA", "MSFT", "META", "GOOGL", "AMZN", "JPM", "GS", "XOM"]
+// ── Sabit hisse sembolleri (Finnhub) ──────────────────────────────────────────
+const STOCK_SYMBOLS = ["AAPL", "TSLA", "NVDA", "MSFT", "META", "GOOGL", "AMZN", "JPM", "GS", "XOM", "PLTR", "AMD", "INTC", "NFLX", "DIS"]
 
-// Map source keywords to categories
-function inferCategory(related: string, source: string): CategoryType {
-  const text = `${related} ${source}`.toLowerCase()
-  if (text.includes("health") || text.includes("pharma") || text.includes("biotech") || text.includes("pfe") || text.includes("jnj")) return "healthcare"
-  if (text.includes("oil") || text.includes("energy") || text.includes("xom") || text.includes("cvx")) return "energy"
-  if (text.includes("bank") || text.includes("financ") || text.includes("jpm") || text.includes("gs")) return "finance"
-  return "technology"
+const COMPANY_NAMES: Record<string, string> = {
+  AAPL: "Apple Inc.", TSLA: "Tesla Inc.", NVDA: "NVIDIA Corp.", MSFT: "Microsoft",
+  META: "Meta Platforms", GOOGL: "Alphabet", AMZN: "Amazon", JPM: "JPMorgan Chase",
+  GS: "Goldman Sachs", XOM: "Exxon Mobil", PLTR: "Palantir", AMD: "AMD",
+  INTC: "Intel", NFLX: "Netflix", DIS: "Disney",
 }
 
 function formatTimeAgo(unixTimestamp: number): string {
@@ -30,160 +22,209 @@ function formatTimeAgo(unixTimestamp: number): string {
   return `${Math.floor(diff / 86400)}d ago`
 }
 
-export async function GET() {
-  // If no API key, return mock data with isLive: false
-  if (!isApiConfigured()) {
-    return NextResponse.json({
-      news: mockNewsData,
-      tickers: mockTickerData,
-      isLive: false,
-      lastUpdated: new Date().toISOString(),
-    })
-  }
+function inferCategory(related: string, source: string): CategoryType {
+  const text = `${related} ${source}`.toLowerCase()
+  if (text.includes("health") || text.includes("pharma") || text.includes("biotech")) return "healthcare"
+  if (text.includes("oil") || text.includes("energy") || text.includes("xom")) return "energy"
+  if (text.includes("bank") || text.includes("financ") || text.includes("jpm")) return "finance"
+  return "technology"
+}
 
+// ── CoinGecko: canlı kripto fiyatları (API key gerektirmez) ───────────────────
+async function fetchCryptoTickers(): Promise<TickerItem[]> {
   try {
-    // Fetch market news
-    const rawNews = await getMarketNews("general")
-    const top12 = rawNews.slice(0, 12)
+    const res = await fetch(
+      "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=50&page=1&sparkline=false&price_change_percentage=24h",
+      { next: { revalidate: 60 } }
+    )
+    if (!res.ok) throw new Error("CoinGecko error")
+    const data = await res.json()
 
-    // Extract symbols mentioned in news
-    const mentionedSymbols = new Set<string>()
-    for (const article of top12) {
-      if (article.related) {
-        article.related.split(",").forEach((s) => {
-          const sym = s.trim().toUpperCase()
-          if (sym && TRACKED_SYMBOLS.includes(sym)) {
-            mentionedSymbols.add(sym)
-          }
-        })
-      }
-    }
+    return data.map((coin: {
+      symbol: string
+      name: string
+      current_price: number
+      price_change_24h: number
+      price_change_percentage_24h: number
+    }) => ({
+      symbol: coin.symbol.toUpperCase(),
+      name: coin.name,
+      price: coin.current_price,
+      change: coin.price_change_24h,
+      changePercent: coin.price_change_percentage_24h,
+      type: "crypto",
+    }))
+  } catch {
+    return []
+  }
+}
 
-    // If few symbols found in news, add some popular ones
-    if (mentionedSymbols.size < 3) {
-      TRACKED_SYMBOLS.slice(0, 5).forEach((s) => mentionedSymbols.add(s))
-    }
+// ── CoinGecko: kripto haberleri ───────────────────────────────────────────────
+async function fetchCryptoNews(): Promise<NewsItem[]> {
+  try {
+    // Top 20 kripto için haber çek
+    const coinsRes = await fetch(
+      "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=20&page=1&sparkline=true",
+      { next: { revalidate: 120 } }
+    )
+    if (!coinsRes.ok) throw new Error("CoinGecko coins error")
+    const coins = await coinsRes.json()
 
-    const symbolList = Array.from(mentionedSymbols)
+    // Her coin için news benzeri veri oluştur (CoinGecko haber API'si premium)
+    // Bunun yerine trending coins + fiyat değişiminden haber oluşturuyoruz
+    const newsItems: NewsItem[] = coins.slice(0, 10).map((coin: {
+      id: string
+      symbol: string
+      name: string
+      current_price: number
+      price_change_percentage_24h: number
+      price_change_24h: number
+      market_cap_rank: number
+      sparkline_in_7d?: { price: number[] }
+    }, idx: number) => {
+      const isUp = coin.price_change_percentage_24h >= 0
+      const absChange = Math.abs(coin.price_change_percentage_24h).toFixed(2)
+      const sentiment: SentimentType = isUp ? "bullish" : "bearish"
 
-    // Fetch quotes, sentiment and candles for mentioned symbols in parallel
-    const now = Math.floor(Date.now() / 1000)
-    const oneDayAgo = now - 86400
+      const headlines = isUp ? [
+        `${coin.name} surges ${absChange}% as crypto market gains momentum`,
+        `${coin.name} breaks resistance level with ${absChange}% gain in 24 hours`,
+        `Institutional interest drives ${coin.name} up ${absChange}% today`,
+      ] : [
+        `${coin.name} drops ${absChange}% amid market uncertainty`,
+        `${coin.name} faces selling pressure, down ${absChange}% in 24 hours`,
+        `${coin.name} declines ${absChange}% as bears take control`,
+      ]
 
-    const [quotesResult, sentimentResult, candlesResult] = await Promise.all([
-      Promise.allSettled(symbolList.map((s) => getQuote(s))),
-      Promise.allSettled(symbolList.map((s) => getNewsSentiment(s))),
-      Promise.allSettled(symbolList.map((s) => getStockCandles(s, "60", oneDayAgo, now))),
-    ])
-
-    // Build lookup maps
-    const quoteMap = new Map<string, { price: number; change: number; changePercent: number }>()
-    const sentimentMap = new Map<string, { type: SentimentType; score: number }>()
-    const sparklineMap = new Map<string, number[]>()
-
-    symbolList.forEach((sym, i) => {
-      const qr = quotesResult[i]
-      if (qr.status === "fulfilled" && qr.value.c > 0) {
-        quoteMap.set(sym, {
-          price: qr.value.c,
-          change: qr.value.d,
-          changePercent: qr.value.dp,
-        })
-      }
-
-      const sr = sentimentResult[i]
-      if (sr.status === "fulfilled" && sr.value.sentiment) {
-        const bull = sr.value.sentiment.bullishPercent
-        const bear = sr.value.sentiment.bearishPercent
-        let type: SentimentType = "neutral"
-        if (bull > bear + 0.1) type = "bullish"
-        else if (bear > bull + 0.1) type = "bearish"
-        sentimentMap.set(sym, { type, score: Math.max(bull, bear) })
-      }
-
-      const cr = candlesResult[i]
-      if (cr.status === "fulfilled" && cr.value.s === "ok" && cr.value.c) {
-        // Take last 10 close prices for sparkline
-        const closes = cr.value.c
-        const sparkData = closes.length > 10 ? closes.slice(-10) : closes
-        sparklineMap.set(sym, sparkData)
-      }
-    })
-
-    // Company name lookup
-    const companyNames: Record<string, string> = {
-      AAPL: "Apple Inc.",
-      TSLA: "Tesla Inc.",
-      NVDA: "NVIDIA Corp.",
-      MSFT: "Microsoft Corp.",
-      META: "Meta Platforms",
-      GOOGL: "Alphabet Inc.",
-      AMZN: "Amazon.com",
-      JPM: "JPMorgan Chase",
-      GS: "Goldman Sachs",
-      XOM: "Exxon Mobil",
-    }
-
-    // Build normalized news items
-    const news: NewsItem[] = top12.map((article, idx) => {
-      // Find the best matching symbol for this article
-      const relatedSymbols = article.related
-        ? article.related.split(",").map((s) => s.trim().toUpperCase()).filter((s) => TRACKED_SYMBOLS.includes(s))
-        : []
-      const primarySymbol = relatedSymbols[0] || symbolList[idx % symbolList.length] || "AAPL"
-      const quote = quoteMap.get(primarySymbol)
-      const sentiment = sentimentMap.get(primarySymbol)
-      const sparkline = sparklineMap.get(primarySymbol)
-
-      // Fallback sentiment from price change
-      let sentimentType: SentimentType = sentiment?.type ?? "neutral"
-      let sentimentScore = sentiment?.score ?? 0.5
-      if (!sentiment && quote) {
-        sentimentType = quote.change >= 0 ? "bullish" : "bearish"
-        sentimentScore = Math.min(0.95, 0.5 + Math.abs(quote.changePercent) / 10)
-      }
+      const sparkline = coin.sparkline_in_7d?.price?.slice(-10) ?? [100, 101, 102, 103, 104]
 
       return {
-        id: article.id.toString(),
-        ticker: primarySymbol,
-        companyName: companyNames[primarySymbol] || primarySymbol,
-        title: article.headline,
-        summary: article.summary || "",
-        source: article.source,
-        time: formatTimeAgo(article.datetime),
-        url: article.url,
-        imageUrl: article.image || "",
-        sentiment: sentimentType,
-        sentimentScore,
-        priceChange: quote?.changePercent ?? 0,
-        currentPrice: quote?.price ?? 0,
-        sparklineData: sparkline || [100, 101, 102, 103, 104, 103, 105, 106, 107, 108],
-        category: inferCategory(article.related || "", article.source),
+        id: `crypto-${coin.id}-${idx}`,
+        ticker: coin.symbol.toUpperCase(),
+        companyName: coin.name,
+        title: headlines[idx % headlines.length],
+        summary: `${coin.name} is currently ranked #${coin.market_cap_rank} by market cap, trading at $${coin.current_price.toLocaleString()} with a ${isUp ? "+" : ""}${coin.price_change_percentage_24h.toFixed(2)}% change in the last 24 hours.`,
+        source: "CoinGecko",
+        time: `${(idx + 1) * 5} min ago`,
+        url: `https://www.coingecko.com/en/coins/${coin.id}`,
+        imageUrl: "",
+        sentiment,
+        sentimentScore: Math.min(0.95, 0.5 + Math.abs(coin.price_change_percentage_24h) / 20),
+        priceChange: coin.price_change_percentage_24h,
+        currentPrice: coin.current_price,
+        sparklineData: sparkline,
+        category: "technology" as CategoryType,
       }
     })
 
-    // Build ticker data from quotes
-    const tickers = symbolList
-      .filter((s) => quoteMap.has(s))
-      .map((sym) => {
-        const q = quoteMap.get(sym)!
-        return {
-          symbol: sym,
-          name: companyNames[sym] || sym,
-          price: q.price,
-          change: q.change,
-          changePercent: q.changePercent,
-        }
-      })
+    return newsItems
+  } catch {
+    return []
+  }
+}
+
+// ── Ana GET handler ───────────────────────────────────────────────────────────
+export async function GET() {
+  try {
+    // Her zaman CoinGecko'dan kripto verisi çek (ücretsiz)
+    const [cryptoTickers, cryptoNews] = await Promise.all([
+      fetchCryptoTickers(),
+      fetchCryptoNews(),
+    ])
+
+    // Finnhub varsa hisse haberlerini de çek
+    let stockNews: NewsItem[] = []
+    let stockTickers: TickerItem[] = []
+
+    if (isApiConfigured()) {
+      try {
+        const now = Math.floor(Date.now() / 1000)
+        const oneDayAgo = now - 86400
+
+        const rawNews = await getMarketNews("general")
+        const top10 = rawNews.slice(0, 10)
+
+        // Hisse fiyatları paralel çek
+        const quotes = await Promise.allSettled(
+          STOCK_SYMBOLS.slice(0, 8).map(s => getQuote(s))
+        )
+
+        stockTickers = STOCK_SYMBOLS.slice(0, 8)
+          .map((sym, i) => {
+            const qr = quotes[i]
+            if (qr.status === "fulfilled" && qr.value.c > 0) {
+              return {
+                symbol: sym,
+                name: COMPANY_NAMES[sym] || sym,
+                price: qr.value.c,
+                change: qr.value.d,
+                changePercent: qr.value.dp,
+              }
+            }
+            return null
+          })
+          .filter(Boolean) as TickerItem[]
+
+        const quoteMap = new Map(
+          STOCK_SYMBOLS.slice(0, 8).map((sym, i) => {
+            const qr = quotes[i]
+            if (qr.status === "fulfilled" && qr.value.c > 0) return [sym, qr.value]
+            return [sym, null]
+          })
+        )
+
+        stockNews = top10.map((article, idx) => {
+          const relatedSymbols = article.related
+            ? article.related.split(",").map(s => s.trim().toUpperCase()).filter(s => STOCK_SYMBOLS.includes(s))
+            : []
+          const primarySymbol = relatedSymbols[0] || STOCK_SYMBOLS[idx % STOCK_SYMBOLS.length]
+          const quote = quoteMap.get(primarySymbol)
+          const isUp = (quote?.dp ?? 0) >= 0
+
+          return {
+            id: article.id.toString(),
+            ticker: primarySymbol,
+            companyName: COMPANY_NAMES[primarySymbol] || primarySymbol,
+            title: article.headline,
+            summary: article.summary || "",
+            source: article.source,
+            time: formatTimeAgo(article.datetime),
+            url: article.url,
+            imageUrl: article.image || "",
+            sentiment: (isUp ? "bullish" : "bearish") as SentimentType,
+            sentimentScore: Math.min(0.95, 0.5 + Math.abs(quote?.dp ?? 0) / 10),
+            priceChange: quote?.dp ?? 0,
+            currentPrice: quote?.c ?? 0,
+            sparklineData: [100, 101, 102, 103, 104, 103, 105, 106, 107, 108],
+            category: inferCategory(article.related || "", article.source),
+          }
+        })
+      } catch {
+        // Finnhub hata verirse sadece mock stock news kullan
+        stockNews = mockNewsData.filter(n => !["BTC", "ETH", "SOL", "BNB", "XRP"].includes(n.ticker))
+      }
+    } else {
+      stockNews = mockNewsData.filter(n => !["BTC", "ETH", "SOL", "BNB", "XRP"].includes(n.ticker))
+      stockTickers = mockTickerData
+    }
+
+    // Kripto + hisse haberlerini karıştır
+    const allNews = [...cryptoNews, ...stockNews].sort(() => Math.random() - 0.5)
+
+    // Ticker bandı: kripto (canlı) + hisse
+    const allTickers = [
+      ...cryptoTickers.slice(0, 30),
+      ...stockTickers,
+    ]
 
     return NextResponse.json({
-      news,
-      tickers: tickers.length > 0 ? tickers : mockTickerData,
-      isLive: true,
+      news: allNews,
+      tickers: allTickers,
+      isLive: cryptoTickers.length > 0,
       lastUpdated: new Date().toISOString(),
     })
   } catch (error) {
-    console.error("Finnhub API error, falling back to mock data:", error)
+    console.error("API error:", error)
     return NextResponse.json({
       news: mockNewsData,
       tickers: mockTickerData,
